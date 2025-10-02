@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "595824803409",
+    "project_id": "step-life",
+    "storage_bucket": "step-life.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:595824803409:android:fce16f5bf68eac05250270",
+        "android_client_info": {
+          "package_name": "com.example.flutter_application_2"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBLccJXfXDZISRHuUxOT1byZpzj_Pkc54E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
