@@ -2,11 +2,9 @@ import 'dart:async';
 import 'dart:math' show sin, cos, sqrt, atan2, pi;
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-import 'package:flutter/services.dart' show rootBundle;
-import 'package:xml/xml.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:geolocator/geolocator.dart';
 
 class InicioScreen extends StatefulWidget {
   const InicioScreen({super.key});
@@ -17,49 +15,156 @@ class InicioScreen extends StatefulWidget {
 
 class _InicioScreenState extends State<InicioScreen> {
   GoogleMapController? _mapController;
-  final Set<Polyline> _polylines = {};
+  StreamSubscription<Position>? _gpsStream;
   final List<LatLng> _route = [];
+  final Set<Polyline> _polylines = {};
   final List<Marker> _markers = [];
-  List<LatLng> _mockPoints = [];
 
   Timer? _timer;
-  int _currentIndex = 0;
-  DateTime? _startTime;
+  Duration _elapsed = Duration.zero;
+  double _totalDistance = 0;
+  bool _isRunning = false;
+  bool _isPaused = false;
 
-  // 🔄 Por defecto usamos GPS real
-  bool _useRealGPS = true;
-  StreamSubscription<Position>? _gpsStream;
+  // 🎨 Paleta
+  final Color naranja = const Color(0xFFFF6B00);
+  final Color grisFondo = const Color(0xFFF4F4F4);
+  final Color grisBarra = const Color(0xFF303030);
+  final Color textoNegro = const Color(0xFF1E1E1E);
 
-  /// 👉 Leer archivo GPX
-  Future<void> _loadGpxRoute() async {
-    final gpxString =
-        await rootBundle.loadString('assets/estadio_loreto.gpx');
-    final gpx = XmlDocument.parse(gpxString);
-
-    final points = gpx.findAllElements('trkpt').map((node) {
-      final lat = double.parse(node.getAttribute('lat')!);
-      final lon = double.parse(node.getAttribute('lon')!);
-      return LatLng(lat, lon);
-    }).toList();
-
-    setState(() {
-      _mockPoints = points;
-    });
-
-    if (_mockPoints.isNotEmpty) {
-      _mapController?.animateCamera(
-        CameraUpdate.newLatLngZoom(_mockPoints.first, 14),
-      );
-
-      _markers.add(Marker(
-        markerId: const MarkerId("posicion"),
-        position: _mockPoints.first,
-        infoWindow: const InfoWindow(title: "Inicio (GPX)"),
-      ));
-    }
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _gpsStream?.cancel();
+    super.dispose();
   }
 
-  /// 👉 Fórmula de Haversine (km)
+  // 📍 Iniciar o reanudar entrenamiento
+  Future<void> _startOrResumeTraining() async {
+    if (_isPaused) {
+      setState(() => _isPaused = false);
+      return;
+    }
+
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text("⚠️ Activa el GPS")));
+      return;
+    }
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) return;
+    }
+    if (permission == LocationPermission.deniedForever) return;
+
+    _route.clear();
+    _polylines.clear();
+    _markers.clear();
+    _totalDistance = 0;
+    _elapsed = Duration.zero;
+    _isRunning = true;
+    _isPaused = false;
+
+    _timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_isRunning && !_isPaused) {
+        setState(() => _elapsed += const Duration(seconds: 1));
+      }
+    });
+
+    _gpsStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high, distanceFilter: 5),
+    ).listen((pos) {
+      if (!_isRunning || _isPaused) return;
+
+      final current = LatLng(pos.latitude, pos.longitude);
+
+      if (_route.isNotEmpty) {
+        _totalDistance += _calculateDistance(_route.last, current);
+      }
+
+      _route.add(current);
+      _updateMap(current);
+    });
+
+    setState(() {});
+  }
+
+  // 🧭 Actualizar mapa
+  void _updateMap(LatLng pos) {
+    setState(() {
+      _polylines.clear();
+      _polylines.add(Polyline(
+        polylineId: const PolylineId("route"),
+        points: _route,
+        color: naranja,
+        width: 6,
+      ));
+      _markers
+        ..clear()
+        ..add(Marker(
+          markerId: const MarkerId("current"),
+          position: pos,
+          infoWindow: const InfoWindow(title: "Posición actual"),
+        ));
+    });
+    _mapController?.animateCamera(CameraUpdate.newLatLng(pos));
+  }
+
+  // 🛑 Pausar
+  void _pauseTraining() => setState(() => _isPaused = true);
+
+  // 🏁 Finalizar (guarda la ruta también)
+  Future<void> _finishTraining() async {
+    _isRunning = false;
+    _timer?.cancel();
+    _gpsStream?.cancel();
+
+    if (_route.isEmpty) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) return;
+
+    final kcal = (_totalDistance * 70).round();
+
+    // 🔹 Guardar la ruta (lista de coordenadas)
+    final ruta = _route
+        .map((p) => {"lat": p.latitude, "lng": p.longitude})
+        .toList();
+
+    final data = {
+      "fecha": DateTime.now(),
+      "distancia": double.parse(_totalDistance.toStringAsFixed(2)),
+      "tiempo":
+          "${_elapsed.inMinutes} min ${_elapsed.inSeconds.remainder(60)} seg",
+      "calorias": kcal,
+      "ruta": ruta, // ← Se guarda la ruta
+    };
+
+    await FirebaseFirestore.instance
+        .collection("users")
+        .doc(user.uid)
+        .collection("trainings")
+        .add(data);
+
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text("🏁 Entrenamiento guardado con recorrido")));
+
+    setState(() {
+      _route.clear();
+      _polylines.clear();
+      _markers.clear();
+      _totalDistance = 0;
+      _elapsed = Duration.zero;
+      _isRunning = false;
+      _isPaused = false;
+    });
+  }
+
+  // 📏 Calcular distancia (Haversine)
   double _calculateDistance(LatLng p1, LatLng p2) {
     const R = 6371;
     final dLat = (p2.latitude - p1.latitude) * pi / 180;
@@ -73,266 +178,161 @@ class _InicioScreenState extends State<InicioScreen> {
     return R * c;
   }
 
-  /// 👉 Simulación GPX
-  void _startMockRoute() {
-    if (_mockPoints.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("⚠️ Ruta GPX no cargada")),
-      );
-      return;
-    }
+  int get _calories => (_totalDistance * 70).round();
 
-    _route.clear();
-    _currentIndex = 0;
-    _timer?.cancel();
-    _startTime = DateTime.now();
-
-    _timer = Timer.periodic(const Duration(seconds: 2), (timer) {
-      if (_currentIndex < _mockPoints.length) {
-        setState(() {
-          final current = _mockPoints[_currentIndex];
-          _route.add(current);
-          _updatePolylineAndMarker(current, Colors.red);
-        });
-
-        _mapController?.animateCamera(
-          CameraUpdate.newLatLng(_mockPoints[_currentIndex]),
-        );
-
-        _currentIndex++;
-      } else {
-        _finishTraining();
-      }
-    });
-  }
-
-  /// 👉 GPS real
-  Future<void> _enableRealGPS() async {
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("⚠️ Activa el GPS para continuar")),
-      );
-      return;
-    }
-
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) return;
-    }
-
-    if (permission == LocationPermission.deniedForever) return;
-
-    _route.clear();
-    _startTime = DateTime.now();
-
-    _gpsStream = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 5,
-      ),
-    ).listen((Position pos) {
-      final current = LatLng(pos.latitude, pos.longitude);
-      setState(() {
-        _route.add(current);
-        _updatePolylineAndMarker(current, Colors.blue);
-      });
-
-      _mapController?.animateCamera(CameraUpdate.newLatLng(current));
-    });
-  }
-
-  /// 👉 Actualizar polyline + marcador
-  void _updatePolylineAndMarker(LatLng current, Color color) {
-    _polylines.clear();
-    _polylines.add(Polyline(
-      polylineId: const PolylineId("route"),
-      points: _route,
-      color: color,
-      width: 5,
-    ));
-
-    _markers.clear();
-    _markers.add(Marker(
-      markerId: const MarkerId("posicion"),
-      position: current,
-      infoWindow: const InfoWindow(title: "Posición actual"),
-    ));
-  }
-
-  /// 👉 Guardar en Firestore
-  Future<void> _saveTrainingToFirestore(
-      double distancia, String tiempo, int calorias) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) return;
-
-    final training = {
-      "distancia": distancia,
-      "tiempo": tiempo,
-      "calorias": calorias,
-      "fecha": DateTime.now(),
-    };
-
-    await FirebaseFirestore.instance
-        .collection("users")
-        .doc(user.uid)
-        .collection("trainings")
-        .add(training);
-  }
-
-  /// 👉 Finalizar entrenamiento
-  void _finishTraining() {
-    _timer?.cancel();
-    _gpsStream?.cancel();
-
-    if (_startTime == null || _route.isEmpty) return;
-
-    final duration = DateTime.now().difference(_startTime!);
-
-    double totalKm = 0;
-    for (int i = 0; i < _route.length - 1; i++) {
-      totalKm += _calculateDistance(_route[i], _route[i + 1]);
-    }
-
-    final calorias = (totalKm * 70).round();
-
-    _saveTrainingToFirestore(
-      double.parse(totalKm.toStringAsFixed(2)),
-      "${duration.inMinutes} min ${duration.inSeconds % 60} seg",
-      calorias,
-    );
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          "🏁 Entrenamiento finalizado\n"
-          "Distancia: ${totalKm.toStringAsFixed(2)} km\n"
-          "Tiempo: ${duration.inMinutes} min ${duration.inSeconds % 60} seg\n"
-          "Calorías: $calorias kcal",
-        ),
-      ),
-    );
-  }
-
-  void _stopRoute() {
-    _finishTraining();
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    _gpsStream?.cancel();
-    super.dispose();
+  String get _formattedTime {
+    final h = _elapsed.inHours.toString().padLeft(2, '0');
+    final m = (_elapsed.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (_elapsed.inSeconds % 60).toString().padLeft(2, '0');
+    return "$h:$m:$s";
   }
 
   @override
   Widget build(BuildContext context) {
-    final user = FirebaseAuth.instance.currentUser;
-
     return Scaffold(
+      backgroundColor: grisFondo,
       appBar: AppBar(
-        title: const Text("Entrenamiento"),
-        actions: [
-          Row(
-            children: [
-              const Text("GPX"),
-              Switch(
-                value: _useRealGPS,
-                onChanged: (val) {
-                  setState(() {
-                    _useRealGPS = val;
-                  });
-                },
-              ),
-              const Text("GPS"),
-              const SizedBox(width: 8),
-            ],
-          ),
-        ],
+        backgroundColor: grisBarra,
+        title: const Text("Entrenamiento",
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        centerTitle: true,
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: GoogleMap(
-              onMapCreated: (controller) {
-                _mapController = controller;
-                if (!_useRealGPS) _loadGpxRoute();
-              },
-              initialCameraPosition: const CameraPosition(
-                target: LatLng(19.0668, -98.1887),
-                zoom: 14,
-              ),
-              polylines: _polylines,
-              markers: Set.from(_markers),
-              myLocationEnabled: _useRealGPS,
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: () =>
-                      _useRealGPS ? _enableRealGPS() : _startMockRoute(),
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text("Iniciar"),
-                ),
-                ElevatedButton.icon(
-                  onPressed: _stopRoute,
-                  icon: const Icon(Icons.stop),
-                  label: const Text("Detener"),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: user == null
-                ? const Center(child: Text("⚠️ No hay usuario logueado"))
-                : StreamBuilder<QuerySnapshot>(
-                    stream: FirebaseFirestore.instance
-                        .collection("users")
-                        .doc(user.uid)
-                        .collection("trainings")
-                        .orderBy("fecha", descending: true)
-                        .snapshots(),
-                    builder: (context, snapshot) {
-                      if (!snapshot.hasData) {
-                        return const Center(child: CircularProgressIndicator());
-                      }
-
-                      final docs = snapshot.data!.docs;
-                      if (docs.isEmpty) {
-                        return const Center(
-                          child: Text("No tienes entrenamientos guardados aún."),
-                        );
-                      }
-
-                      return ListView.builder(
-                        itemCount: docs.length,
-                        itemBuilder: (context, index) {
-                          final data =
-                              docs[index].data() as Map<String, dynamic>;
-                          final fecha = (data["fecha"] as Timestamp).toDate();
-
-                          return ListTile(
-                            leading: const Icon(Icons.directions_run),
-                            title: Text("Distancia: ${data["distancia"]} km"),
-                            subtitle: Text(
-                                "Tiempo: ${data["tiempo"]} | Calorías: ${data["calorias"]} kcal"),
-                            trailing: Text(
-                              "${fecha.day}/${fecha.month}/${fecha.year}",
-                              style: const TextStyle(fontSize: 12),
-                            ),
-                          );
-                        },
-                      );
-                    },
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(20),
+              child: Container(
+                height: MediaQuery.of(context).size.height * 0.48,
+                child: GoogleMap(
+                  onMapCreated: (controller) => _mapController = controller,
+                  initialCameraPosition: const CameraPosition(
+                    target: LatLng(19.0668, -98.1887),
+                    zoom: 15,
                   ),
-          ),
-        ],
+                  polylines: _polylines,
+                  markers: Set.from(_markers),
+                  myLocationEnabled: true,
+                  zoomControlsEnabled: false,
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // Datos
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Column(
+                children: [
+                  Text(_formattedTime,
+                      style: TextStyle(
+                          fontSize: 42,
+                          fontWeight: FontWeight.bold,
+                          color: textoNegro)),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      _StatItem(
+                          label: "Distancia",
+                          value: "${_totalDistance.toStringAsFixed(2)} km",
+                          color: naranja),
+                      _StatItem(
+                          label: "Calorías",
+                          value: "$_calories kcal",
+                          color: naranja),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const Spacer(),
+
+            if (!_isPaused)
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isRunning ? Colors.black : naranja,
+                    padding:
+                        const EdgeInsets.symmetric(vertical: 22, horizontal: 0),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(50)),
+                  ),
+                  onPressed:
+                      _isRunning ? _pauseTraining : _startOrResumeTraining,
+                  child: Text(
+                    _isRunning ? "Pausar" : "Iniciar",
+                    style: const TextStyle(
+                        fontSize: 22, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            if (_isPaused)
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: naranja,
+                        padding: const EdgeInsets.symmetric(vertical: 20),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(50)),
+                      ),
+                      onPressed: _startOrResumeTraining,
+                      child: const Text("Reanudar",
+                          style: TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 20),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(50)),
+                      ),
+                      onPressed: _finishTraining,
+                      child: const Text("Finalizar",
+                          style: TextStyle(
+                              fontSize: 20, fontWeight: FontWeight.bold)),
+                    ),
+                  ),
+                ],
+              ),
+            const SizedBox(height: 20),
+          ],
+        ),
       ),
+    );
+  }
+}
+
+class _StatItem extends StatelessWidget {
+  final String label;
+  final String value;
+  final Color color;
+  const _StatItem(
+      {required this.label, required this.value, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Text(value,
+            style: TextStyle(
+                fontSize: 28, fontWeight: FontWeight.bold, color: color)),
+        Text(label,
+            style: const TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w500, color: Colors.black54)),
+      ],
     );
   }
 }
